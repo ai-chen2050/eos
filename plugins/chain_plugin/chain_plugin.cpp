@@ -22,9 +22,20 @@
 #include <eosio/utilities/common.hpp>
 #include <eosio/chain/wast_to_wasm.hpp>
 
+#include <eosio/wallet_plugin/wallet_plugin.hpp>
+#include <eosio/wallet_plugin/wallet_manager.hpp>
+
 #include <boost/signals2/connection.hpp>
 #include <boost/algorithm/string.hpp>
 #include <boost/lexical_cast.hpp>
+#include <boost/filesystem.hpp>
+#include <boost/range/algorithm/find_if.hpp>
+#include <boost/range/algorithm/sort.hpp>
+#include <boost/range/adaptor/transformed.hpp>
+#include <boost/algorithm/string/predicate.hpp>
+#include <boost/algorithm/string/split.hpp>
+#include <boost/range/algorithm/copy.hpp>
+#include <boost/algorithm/string/classification.hpp>
 
 #include <fc/io/json.hpp>
 #include <fc/variant.hpp>
@@ -1492,6 +1503,174 @@ void read_write::push_block(const read_write::push_block_params& params, next_fu
       chain_plugin::handle_db_exhaustion();
    } CATCH_AND_CALL(next);
 }
+
+// add by chen 
+void read_write::push_action(const read_write::push_action_params& params, next_function<read_write::push_transaction_results> next)
+{
+      try
+      {
+            auto pretty_input = std::make_shared<packed_transaction>();
+            auto resolver = make_resolver(this,abi_serializer_max_time);
+            fc::variant test;
+            chain_apis::read_only read_only(db,abi_serializer_max_time);
+            try
+            {
+			ilog("----------- log -------------");
+                  fc::to_variant(params,test);
+            }EOS_RETHROW_EXCEPTIONS(chain::packed_transaction_type_exception, "Invalid packed transaction")
+            ilog("----------- log -------------");
+
+            ilog( "Json from network: ${test}", ("test", fc::json::to_pretty_string(test)));
+            // create action  
+            //'{"code":"eosio.token", "action":"transfer","perm":"bob" 
+            // "args":{"from":"bob", "to":"eospixels", "quantity":"100.0000 EOS", "memo":"k5k36s7pxb"}}'
+            fc::string  code = params.find("code")->value().as_string();
+            fc::string action = params.find("action")->value().as_string();
+            fc::variant perm = params.find("perm")->value();
+            fc::variant action_args_var = params.find("args")->value();
+
+            // �� action_args_var ת���� json ��ʽ
+            // typedef boost::basic_regex<char>    regex;
+            // regex r("^[ \t]*[\{\[]");
+            // if ( !regex_search(action_args_var.as_string(), r) && fc::is_regular_file(fc::path(action_args_var.as_string())) ) {
+            //       action_args_var = fc::json::from_file(action_args_var.as_string(), fc::json::relaxed_parser);
+            // } else {
+            //       action_args_var = fc::json::from_string(action_args_var.as_string(), fc::json::relaxed_parser);
+            // }
+            // read_only::abi_json_to_bin_params bin_params;
+            // bin_params.code = code; 
+            // bin_params.action = action;
+            // bin_params.args = action_args_var;
+            auto abi_serializer_resolver = [&](const name& code) -> optional<abi_serializer> {
+            static unordered_map<account_name, optional<abi_serializer> > abi_cache;
+            auto it = abi_cache.find( code );
+            if ( it == abi_cache.end() ) {
+
+                  read_only::get_abi_params abi_params;
+                  abi_params.account_name = code;
+                  auto abi_results = read_only.get_abi(abi_params);
+                  // = call(get_abi_func, fc::mutable_variant_object("account_name", account));
+                  // auto abi_results = result.abi.as<eosio::chain_apis::read_only::get_abi_results>();
+
+                  optional<abi_serializer> abis;
+                  if( abi_results.abi.valid() ) {
+                  abis.emplace( *abi_results.abi, abi_serializer_max_time );
+                  } else {
+                  std::cerr << "ABI for contract " << code.to_string() << " not found. Action data will be shown in hex only." << std::endl;
+                  }
+                  abi_cache.emplace( code, abis );
+
+                  return abis;
+            }
+
+            return it->second;
+            };
+
+
+            const account_name code2(code);
+            const action_name action2(action);
+            const fc::variant action_args_var2(action_args_var);
+
+            auto abis = abi_serializer_resolver(code2);
+            FC_ASSERT( abis.valid(), "No ABI found for ${code}", ("code", code));
+
+            auto action_type = abis->get_action_type( action2 );
+            FC_ASSERT( !action_type.empty(), "Unknown action ${action2} in contract ${code}", ("action2", action2)( "code", code ));
+
+             vector<std::string> perms;
+             perms.push_back(perm.as_string());
+             auto fixedPermissions = perms | boost::adaptors::transformed([](const string& p) {
+                  vector<string> pieces;
+                  split(pieces, p, boost::algorithm::is_any_of("@"));
+                  if( pieces.size() == 1 ) pieces.push_back( "active" );
+                  return chain::permission_level{ .actor = pieces[0], .permission = pieces[1] };
+            });
+            vector<chain::permission_level> accountPermissions;
+            boost::range::copy(fixedPermissions, back_inserter(accountPermissions));
+
+            std::vector<chain::action> actions;
+            actions.push_back(chain::action{accountPermissions,code,action,abis->variant_to_binary( action_type, action_args_var2, abi_serializer_max_time )});
+            
+            // define some args of push_trasaction
+            int32_t extra_kcpu = 1000;
+            // packed_transaction::compression_type compression = packed_transaction::none;
+            
+            // signed transaction
+            signed_transaction trx;
+            trx.actions = std::forward<decltype(actions)>(actions);
+
+            auto tx_expiration = fc::seconds(30);
+            string tx_ref_block_num_or_id;
+
+            // get info 
+            auto info = read_only.get_info(chain_apis::empty());
+            if (trx.signatures.size() == 0) { // #5445 can't change txn content if already signed
+                  trx.expiration = info.head_block_time + tx_expiration;
+
+                  // Set tapos, default to last irreversible block if it's not specified by the user
+                  block_id_type ref_block_id = info.last_irreversible_block_id;
+                  try {
+                  fc::variant ref_block;
+                  if (!tx_ref_block_num_or_id.empty()) {
+                        //ref_block = call(get_block_func, fc::mutable_variant_object("block_num_or_id", tx_ref_block_num_or_id));
+                        read_only::get_block_params block_num_or_id1;
+                        block_num_or_id1.block_num_or_id = tx_ref_block_num_or_id;
+                        ref_block = read_only.get_block(block_num_or_id1);
+                        ref_block_id = ref_block["id"].as<block_id_type>();
+                  }
+                  } EOS_RETHROW_EXCEPTIONS(invalid_ref_block_exception, "Invalid reference block num or id: ${block_num_or_id}", ("block_num_or_id", tx_ref_block_num_or_id));
+                  trx.set_reference_block(ref_block_id);
+
+                  // if (tx_force_unique) {
+                  // trx.context_free_actions.emplace_back( chain::action( {}, config::null_account_name, "nonce", fc::raw::pack(fc::time_point::now().time_since_epoch().count())) );
+                  // }
+
+                  trx.max_cpu_usage_ms = 0;
+                  trx.max_net_usage_words = (0 + 7)/8;
+            }
+
+            // sign trasactions
+
+            // --------------- on doing -------------------
+            // auto required_keys = determine_required_keys(trx); call(wallet_url, wallet_public_keys);
+            // const auto& public_keys = perm;
+            auto& wallet_mgr = app().get_plugin<wallet_plugin>().get_wallet_manager();
+            const auto& public_keys = wallet_mgr.get_public_keys();
+            // auto get_arg = fc::mutable_variant_object
+            //       ("transaction", (transaction)trx)
+            //       ("available_keys", public_keys);
+            
+            // const auto& required_keys = call(get_required_keys, get_arg);
+            read_only::get_required_keys_params required_keys_params;
+            required_keys_params.transaction = (transaction)trx;
+            required_keys_params.available_keys = public_keys; 
+            // return required_keys["required_keys"];
+
+            auto required_key = read_only.get_required_keys(required_keys_params);
+
+            wallet_mgr.sign_transaction(trx, required_key.required_keys, info.chain_id);
+
+            const std::shared_ptr<read_write::push_transactions_results> results;
+            auto push_action_next = [=](const fc::static_variant<fc::exception_ptr, read_write::push_transaction_results>& result) {
+                  if (result.contains<fc::exception_ptr>()) {
+                  const auto& e = result.get<fc::exception_ptr>();
+                  results->emplace_back( read_write::push_transaction_results{ transaction_id_type(), fc::mutable_variant_object( "error", e->to_detail_string() ) } );
+                  } else {
+                  const auto& r = result.get<read_write::push_transaction_results>();
+                  results->emplace_back( r );
+                  }
+            };
+            
+            variant_object push_transaction_args;
+            from_variant( fc::variant(packed_transaction(trx, packed_transaction::none)), push_transaction_args);
+            push_transaction(push_transaction_args,push_action_next);
+            // return log
+            // next(read_write::push_transaction_results{id, output});
+      }catch ( boost::interprocess::bad_alloc& ) {
+      raise(SIGUSR1);
+   } CATCH_AND_CALL(next);
+}
+
 
 void read_write::push_transaction(const read_write::push_transaction_params& params, next_function<read_write::push_transaction_results> next) {
 

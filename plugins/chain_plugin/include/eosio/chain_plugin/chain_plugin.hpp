@@ -533,6 +533,10 @@ public:
    using push_block_results = empty;
    void push_block(const push_block_params& params, chain::plugin_interface::next_function<push_block_results> next);
 
+   
+   using push_action_params = fc::variant_object;
+   void read_write::push_action(const read_write::push_action_params& params, next_function<read_write::push_transaction_results> next);
+
    using push_transaction_params = fc::variant_object;
    struct push_transaction_results {
       chain::transaction_id_type  transaction_id;
